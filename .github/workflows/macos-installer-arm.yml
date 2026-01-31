@@ -34,7 +34,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install py2app==0.28.6 pyinstaller==6.1.0
+          pip install py2app==0.28.6 "pyinstaller>=6.1.0,<7" rumps pyobjc-framework-ServiceManagement
       
       - name: Extract metadata
         id: meta
@@ -61,51 +61,51 @@ jobs:
           import time
           from datetime import datetime
 
-          # Ensure Desktop log for critical errors
-          desktop_log = os.path.expanduser("~/Desktop/huntarr_error.log")
-          with open(desktop_log, "a") as f:
-              f.write(f"\n[{datetime.now().isoformat()}] Starting app_launcher.py\n")
-
           # Setup base paths before anything else - Use a location that doesn't require admin privileges
-          # First try the app bundle location, then fall back to Documents folder which usually has permissions
           bundle_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
           if hasattr(sys, "_MEIPASS"):
               bundle_dir = sys._MEIPASS
           
           app_name = "Huntarr"
-          # Use app's own directory for storage to avoid permission issues
+          home = os.path.expanduser("~")
           if os.path.exists(os.path.join(bundle_dir, "Contents", "Resources")):
-              # Running as a .app bundle
-              with open(desktop_log, "a") as f:
-                  f.write(f"Detected running as .app bundle\n")
               resources_dir = os.path.join(bundle_dir, "Contents", "Resources")
               config_dir = os.path.join(resources_dir, "config")
           else:
-              # Create config in user's Documents folder as a safer alternative
-              home = os.path.expanduser("~")
               config_dir = os.path.join(home, "Documents", app_name, "config")
-              with open(desktop_log, "a") as f:
-                  f.write(f"Using Documents folder for configuration: {config_dir}\n")
           
-          # Set up log directory
           log_dir = os.path.join(config_dir, "logs")
+          # Create config and logs dirs first so we can write error log there (not on Desktop)
+          try:
+              os.makedirs(config_dir, exist_ok=True)
+              os.makedirs(log_dir, exist_ok=True)
+          except Exception:
+              pass
+          error_log = os.path.join(log_dir, "huntarr_error.log")
+          try:
+              with open(error_log, "a") as f:
+                  f.write(f"\n[{datetime.now().isoformat()}] Starting app_launcher.py\n")
+                  f.write(f"Config: {config_dir}\n")
+          except Exception:
+              pass
 
-          # Create essential directories
+          # Create remaining essential directories
           for dir_path in [
-              config_dir,
               os.path.join(config_dir, "settings"),
               os.path.join(config_dir, "stateful"),
               os.path.join(config_dir, "user"),
-              os.path.join(config_dir, "logs"),
               os.path.join(config_dir, "scheduler"),
           ]:
               try:
                   os.makedirs(dir_path, exist_ok=True)
-                  with open(desktop_log, "a") as f:
+                  with open(error_log, "a") as f:
                       f.write(f"Created directory: {dir_path}\n")
               except Exception as e:
-                  with open(desktop_log, "a") as f:
-                      f.write(f"Error creating directory {dir_path}: {str(e)}\n")
+                  try:
+                      with open(error_log, "a") as f:
+                          f.write(f"Error creating directory {dir_path}: {str(e)}\n")
+                  except Exception:
+                      pass
 
           # Configure logging
           try:
@@ -120,19 +120,18 @@ jobs:
               logger = logging.getLogger("Huntarr")
               logger.setLevel(logging.DEBUG)
               
-              # Make sure log messages appear at the appropriate levels
               for handler in logger.handlers:
                   handler.setLevel(logging.DEBUG)
-                  
-              # Keep routine success messages at DEBUG level to reduce log clutter
-              # Only show ERROR level for actual errors
               logging.getLogger('werkzeug').setLevel(logging.WARNING)
               
-              with open(desktop_log, "a") as f:
+              with open(error_log, "a") as f:
                   f.write("Logging system initialized\n")
           except Exception as e:
-              with open(desktop_log, "a") as f:
-                  f.write(f"Error setting up logging: {str(e)}\n")
+              try:
+                  with open(error_log, "a") as f:
+                      f.write(f"Error setting up logging: {str(e)}\n")
+              except Exception:
+                  pass
               raise
 
           # Create necessary default config files if they don't exist
@@ -172,8 +171,8 @@ jobs:
               os.environ["HUNTARR_CONFIG_DIR"] = config_dir
               os.environ["FLASK_ENV"] = "production"
               
-              # Create a file to record the config location for other processes
-              config_location_file = os.path.join(os.path.dirname(desktop_log), "huntarr_config_location.txt")
+              # Create a file to record the config location for other processes (in Huntarr config, not Desktop)
+              config_location_file = os.path.join(config_dir, "config_location.txt")
               with open(config_location_file, "w") as f:
                   f.write(config_dir)
               
@@ -193,6 +192,7 @@ jobs:
                   config_dir = temp_config_dir
                   log_dir = os.path.join(config_dir, "logs")
                   os.makedirs(log_dir, exist_ok=True)
+                  error_log = os.path.join(log_dir, "huntarr_error.log")
                   os.environ["HUNTARR_CONFIG_DIR"] = config_dir
                   logger.warning(f"Switched to temporary directory: {config_dir}")
                   with open(config_location_file, "w") as f:
@@ -236,29 +236,50 @@ jobs:
                   logger.error(f"Failed to import main: {str(e)}")
                   raise
               
-              # Start the main application
-              logger.debug("Starting main application")
-              main.main()
+              # Open default browser after a short delay so user sees the app is running
+              def open_browser():
+                  time.sleep(3)
+                  try:
+                      import webbrowser
+                      webbrowser.open('http://127.0.0.1:9705')
+                  except Exception as e:
+                      logger.debug(f"Could not open browser: {e}")
+              
+              import threading
+              threading.Thread(target=open_browser, daemon=True).start()
+              
+              # On macOS run server in a thread and show menu bar icon (Open Huntarr, Quit, Open at Login)
+              if sys.platform == 'darwin':
+                  logger.debug("Starting main application in background thread (macOS menu bar)")
+                  server_thread = threading.Thread(target=main.main, daemon=False)
+                  server_thread.start()
+                  try:
+                      from src.primary.macos_menubar import run_menubar
+                      run_menubar()
+                  finally:
+                      server_thread.join(timeout=10)
+              else:
+                  logger.debug("Starting main application")
+                  main.main()
           except Exception as e:
               logger.exception(f"Fatal error in app_launcher: {str(e)}")
-              with open(desktop_log, "a") as f:
-                  f.write(f"\n[{datetime.now().isoformat()}] FATAL ERROR: {str(e)}\n")
-                  f.write("\nTraceback:\n")
-                  traceback.print_exc(file=f)
-                  
-                  # Add more diagnostic information
-                  f.write("\n\nSystem Information:\n")
-                  f.write(f"Python version: {sys.version}\n")
-                  f.write(f"Python path: {sys.path}\n")
-                  f.write(f"Working directory: {os.getcwd()}\n")
-                  
-                  # Try to list directory contents
-                  try:
-                      f.write("\nDirectory contents:\n")
-                      for item in os.listdir(os.getcwd()):
-                          f.write(f"  {item}\n")
-                  except Exception as dir_err:
-                      f.write(f"Error listing directory: {str(dir_err)}\n")
+              try:
+                  with open(error_log, "a") as f:
+                      f.write(f"\n[{datetime.now().isoformat()}] FATAL ERROR: {str(e)}\n")
+                      f.write("\nTraceback:\n")
+                      traceback.print_exc(file=f)
+                      f.write("\n\nSystem Information:\n")
+                      f.write(f"Python version: {sys.version}\n")
+                      f.write(f"Python path: {sys.path}\n")
+                      f.write(f"Working directory: {os.getcwd()}\n")
+                      try:
+                          f.write("\nDirectory contents:\n")
+                          for item in os.listdir(os.getcwd()):
+                              f.write(f"  {item}\n")
+                      except Exception as dir_err:
+                          f.write(f"Error listing directory: {str(dir_err)}\n")
+              except Exception:
+                  pass
           EOF
 
       - name: Create runtime hook
@@ -287,35 +308,45 @@ jobs:
       - name: Create icon
         run: |
           mkdir -p icon.iconset
-          sips -s format png frontend/static/logo/huntarr.ico --out icon.iconset/icon_16x16.png --resampleWidth 16 || true
-          sips -s format png frontend/static/logo/huntarr.ico --out icon.iconset/icon_32x32.png --resampleWidth 32 || true
-          sips -s format png frontend/static/logo/huntarr.ico --out icon.iconset/icon_64x64.png --resampleWidth 64 || true
-          sips -s format png frontend/static/logo/huntarr.ico --out icon.iconset/icon_128x128.png --resampleWidth 128 || true
-          sips -s format png frontend/static/logo/huntarr.ico --out icon.iconset/icon_256x256.png --resampleWidth 256 || true
-          sips -s format png frontend/static/logo/huntarr.ico --out icon.iconset/icon_512x512.png --resampleWidth 512 || true
-          
-          cp icon.iconset/icon_32x32.png icon.iconset/icon_16x16@2x.png || true
-          cp icon.iconset/icon_64x64.png icon.iconset/icon_32x32@2x.png || true
-          cp icon.iconset/icon_128x128.png icon.iconset/icon_64x64@2x.png || true
-          cp icon.iconset/icon_256x256.png icon.iconset/icon_128x128@2x.png || true
-          cp icon.iconset/icon_512x512.png icon.iconset/icon_256x256@2x.png || true
-          
-          iconutil -c icns icon.iconset -o frontend/static/logo/huntarr.icns || true
-          
-          # If icon conversion fails, create a fallback icon
+          # Use existing PNGs from repo (sips may not handle .ico on all macOS)
+          for size in 16 32 64 128 256 512; do
+            src="frontend/static/logo/${size}.png"
+            if [ -f "$src" ]; then
+              cp "$src" "icon.iconset/icon_${size}x${size}.png"
+            else
+              sips -s format png frontend/static/logo/huntarr.ico --out "icon.iconset/icon_${size}x${size}.png" --resampleWidth $size 2>/dev/null || true
+            fi
+          done
+          # Create @2x variants from next size up
+          [ -f icon.iconset/icon_32x32.png ] && cp icon.iconset/icon_32x32.png icon.iconset/icon_16x16@2x.png
+          [ -f icon.iconset/icon_64x64.png ] && cp icon.iconset/icon_64x64.png icon.iconset/icon_32x32@2x.png
+          [ -f icon.iconset/icon_128x128.png ] && cp icon.iconset/icon_128x128.png icon.iconset/icon_64x64@2x.png
+          [ -f icon.iconset/icon_256x256.png ] && cp icon.iconset/icon_256x256.png icon.iconset/icon_128x128@2x.png
+          [ -f icon.iconset/icon_512x512.png ] && cp icon.iconset/icon_512x512.png icon.iconset/icon_256x256@2x.png
+          iconutil -c icns icon.iconset -o frontend/static/logo/huntarr.icns
           if [ ! -f frontend/static/logo/huntarr.icns ]; then
-            cp /System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns frontend/static/logo/huntarr.icns || true
+            cp /System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns frontend/static/logo/huntarr.icns
           fi
 
       - name: Create PyInstaller spec
         run: |
-          cat > Huntarr.spec << 'EOF'
+          cat > Huntarr.spec << 'SPECEOF'
           # -*- mode: python ; coding: utf-8 -*-
+          import os
+          import sys
           from PyInstaller.building.api import PYZ, EXE, COLLECT
           from PyInstaller.building.build_main import Analysis
           from PyInstaller.building.datastruct import Tree
-          import os
-          import sys
+          # BUNDLE is macOS-only (wraps COLLECT into .app); location varies by PyInstaller version
+          if sys.platform != 'darwin':
+              raise SystemExit('This spec is for macOS only.')
+          try:
+              from PyInstaller.building.api import BUNDLE
+          except ImportError:
+              try:
+                  from PyInstaller.building.osx import BUNDLE
+              except ImportError:
+                  from PyInstaller.utils.osx import BUNDLE
           
           block_cipher = None
           
@@ -362,6 +393,12 @@ jobs:
                   'qrcode.image.pil',
                   'routes',
                   'main',
+                  # macOS menu bar (status bar) icon
+                  'rumps',
+                  'Foundation',
+                  'AppKit',
+                  'ServiceManagement',
+                  'objc',
                   # Apprise notification support
                   'apprise',
                   'apprise.common', 
@@ -408,7 +445,7 @@ jobs:
               console=True,
               disable_windowed_traceback=False,
               argv_emulation=True,
-              target_arch=None,
+              target_arch='arm64',
               codesign_identity=None,
               entitlements_file=None,
               icon='frontend/static/logo/huntarr.icns',
@@ -435,6 +472,7 @@ jobs:
                   'CFBundleVersion': '${{ steps.meta.outputs.VERSION }}',
                   'NSHighResolutionCapable': True,
                   'NSRequiresAquaSystemAppearance': False,
+                  'LSUIElement': False,
                   'LSEnvironment': {
                       'HUNTARR_CONFIG_DIR': '~/Library/Application Support/Huntarr/config',
                       'PYTHONPATH': '@executable_path/../Resources',
@@ -443,7 +481,7 @@ jobs:
                   'NSPrincipalClass': 'NSApplication',
               },
           )
-          EOF
+          SPECEOF
 
       - name: Build macOS app bundle
         run: python -m PyInstaller Huntarr.spec --clean
@@ -492,11 +530,35 @@ jobs:
                   --install-location /Applications \
                   ${pkg_name}
       
+      - name: Create macOS run instructions
+        run: |
+          cat > Huntarr-macOS-README.txt << 'EOF'
+          Huntarr macOS (Apple Silicon)
+
+          INSTALLATION
+          -------------
+          When you run the installer, macOS may show "Huntarr cannot be opened" or ask you to move to Trash or hit Done. Hit DONE (do not move to Trash).
+
+          Then:
+          1. Go to System Settings (or System Preferences) → Privacy and Security.
+          2. Under Security, find the message about Huntarr being blocked. Click "Allow" or "Open Anyway" for Huntarr.
+          3. When the install prompt appears again, click "Open Anyway" again. Huntarr will then install.
+
+          After installing, open Huntarr from Applications. The app will start the server and open your browser at http://127.0.0.1:9705 after a few seconds.
+
+          If nothing appears:
+          - Check Huntarr logs: ~/Documents/Huntarr/config/logs/huntarr_error.log (or ~/Library/Application Support/Huntarr/config/logs/)
+          - Open http://127.0.0.1:9705 in your browser manually; the server may already be running.
+          - Config and logs: ~/Documents/Huntarr/config or ~/Library/Application Support/Huntarr/config
+          EOF
+
       - name: Upload installer as artifact
         uses: actions/upload-artifact@v4
         with:
           name: huntarr-macos-arm64-installer
-          path: '*.pkg'
+          path: |
+            *.pkg
+            Huntarr-macOS-README.txt
           retention-days: 30
       
       - name: Upload to release
